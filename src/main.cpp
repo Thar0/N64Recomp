@@ -70,6 +70,7 @@ std::unordered_set<std::string> reimplemented_funcs{
     "osPfsReadWriteFile",
     // Parallel interface (cartridge, DMA, etc.) functions
     "osCartRomInit",
+    "osDriveRomInit",
     "osCreatePiManager",
     "osPiStartDma",
     "osEPiStartDma",
@@ -542,7 +543,9 @@ std::unordered_set<std::string> renamed_funcs{
     "sqrt",
     "sqrtf",
     "memcpy",
+    "memcmp",
     "memset",
+    "memmove",
     "strcmp",
     "strcat",
     "strcpy",
@@ -562,6 +565,8 @@ std::unordered_set<std::string> renamed_funcs{
     "floor",
     "floorf",
     "fmodf",
+    "fmod",
+    "modf",
     "lround",
     "lroundf",
     "nearbyint",
@@ -575,6 +580,12 @@ std::unordered_set<std::string> renamed_funcs{
     "malloc",
     "free",
     "realloc",
+    "rand",
+    "srand",
+    "random",
+    "gcvt",
+    "fcvt",
+    "ecvt",
 };
 
 bool read_symbols(RecompPort::Context& context, const ELFIO::elfio& elf_file, ELFIO::section* symtab_section, uint32_t entrypoint, bool has_entrypoint, bool use_absolute_symbols) {
