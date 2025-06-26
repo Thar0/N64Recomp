@@ -6,6 +6,8 @@
 #include "recompiler/context.h"
 #include "elfio/elfio.hpp"
 
+#include "mdebug.h"
+
 bool read_symbols(N64Recomp::Context& context, const ELFIO::elfio& elf_file, ELFIO::section* symtab_section, const N64Recomp::ElfParsingConfig& elf_config, bool dumping_context, std::unordered_map<uint16_t, std::vector<N64Recomp::DataSymbol>>& data_syms) {
     bool found_entrypoint_func = false;
     ELFIO::symbol_section_accessor symbols{ elf_file, symtab_section };
@@ -195,6 +197,83 @@ bool read_symbols(N64Recomp::Context& context, const ELFIO::elfio& elf_file, ELF
     return found_entrypoint_func;
 }
 
+void read_mdebug(N64Recomp::Context& context, ELFIO::section* mdebug_section, std::unordered_map<uint16_t, std::vector<N64Recomp::DataSymbol>>& data_syms) {
+    if (mdebug_section == nullptr) {
+        return;
+    }
+
+    ELFIO::Elf64_Off base_offset = mdebug_section->get_offset();
+    const char *mdata = mdebug_section->get_data();
+
+    // Read, byteswap and relocate the symbolic header. Relocation here means convert file-relative offsets to section-relative offsets.
+
+    MDebug::HDRR hdrr;
+    std::memcpy(&hdrr, mdata, sizeof(MDebug::HDRR));
+    hdrr.swap();
+    hdrr.relocate(base_offset);
+
+    // Check the magic value and version number are what we expect.
+
+    if (hdrr.magic != MDebug::MAGIC || hdrr.vstamp != 0) {
+        fmt::print(stderr, "Warning: Found an mdebug section with bad magic value or version (magic={} version={}). Skipping.\n", hdrr.magic, hdrr.vstamp);
+        return;
+    }
+
+    // Read the various records that are relevant for collecting static symbols and where they are declared.
+
+    std::vector<MDebug::FDR> fdrs = hdrr.read_fdrs(mdata);
+    std::vector<MDebug::AUX> all_auxs = hdrr.read_auxs(mdata);
+    std::vector<MDebug::PDR> all_pdrs = hdrr.read_pdrs(mdata);
+    std::vector<MDebug::SYMR> all_symrs = hdrr.read_symrs(mdata);
+
+    // For each file descriptor
+    for (MDebug::FDR& fdr : fdrs) {
+        const char* fdr_name = fdr.get_name(mdata + hdrr.cbSsOffset);
+
+        // Consider only procedures and symbols defined in this file
+        std::span<MDebug::AUX> auxs = fdr.get_auxs(all_auxs);
+        std::span<MDebug::PDR> pdrs = fdr.get_pdrs(all_pdrs);
+        std::span<MDebug::SYMR> symrs = fdr.get_symrs(all_symrs);
+
+        std::vector<std::pair<uint32_t,uint32_t>> bounds(pdrs.size());
+
+        // For each procedure record, determine which symbols belong to it
+        for (MDebug::PDR& pdr : pdrs) {
+            auto res = pdr.sym_bounds(symrs, auxs);
+            bounds.push_back(res);
+        }
+
+        // For each symbol defined in this file
+        for (uint32_t isym = 0; isym < symrs.size(); isym++) {
+            MDebug::SYMR& symr = symrs[isym];
+
+            // Skip non-statics
+            if (symr.get_st() != MDebug::ST_STATIC && symr.get_st() != MDebug::ST_STATICPROC) {
+                continue;
+            }
+
+            // Find the name of the PDR, if any, that contains this symbol. We computed the (ordered)
+            // symbol bounds above, bsearch for the PDR.
+            auto it = std::lower_bound(bounds.begin(), bounds.end(), isym,
+                [](const auto& bound, uint32_t x) {
+                    return bound.second <= x;
+                }
+            );
+            const char* pdr_name = nullptr;
+            if (it != bounds.end() && it->first <= isym && isym < it->second) {
+                // The procedure name is the name of the first symbol
+                pdr_name = fdr.get_string(mdata + hdrr.cbSsOffset, symrs[it->first].iss);
+            }
+
+            // Get the name of the static symbol
+            const char* sym_name = fdr.get_string(mdata + hdrr.cbSsOffset, symr.iss);
+
+            // Present info (TODO: plug into everything else)
+            std::printf("0x%08X %s (in %s, in %s)\n", symr.value, sym_name, pdr_name, fdr_name);
+        }
+    }
+}
+
 struct SegmentEntry {
     ELFIO::Elf64_Off data_offset;
     ELFIO::Elf64_Addr physical_address;
@@ -215,7 +294,7 @@ std::optional<size_t> get_segment(const std::vector<SegmentEntry>& segments, ELF
     return std::nullopt;
 }
 
-ELFIO::section* read_sections(N64Recomp::Context& context, const N64Recomp::ElfParsingConfig& elf_config, const ELFIO::elfio& elf_file) {
+ELFIO::section* read_sections(N64Recomp::Context& context, ELFIO::section*& mdebug_section_out, const N64Recomp::ElfParsingConfig& elf_config, const ELFIO::elfio& elf_file) {
     ELFIO::section* symtab_section = nullptr;
     std::vector<SegmentEntry> segments{};
     segments.resize(elf_file.segments.size());
@@ -281,6 +360,11 @@ ELFIO::section* read_sections(N64Recomp::Context& context, const N64Recomp::ElfP
         // Check if this section is the symbol table and record it if so
         if (type == ELFIO::SHT_SYMTAB) {
             symtab_section = section.get();
+        }
+
+        // Check if this section is an mdebug section and record it if so. Note we expect just one mdebug section
+        if (type == 0x70000005/* SHT_MIPS_DEBUG */) {
+            mdebug_section_out = section.get();
         }
 
         if (elf_config.all_sections_relocatable || elf_config.relocatable_sections.contains(section_name)) {
@@ -637,7 +721,8 @@ bool N64Recomp::Context::from_elf_file(const std::filesystem::path& elf_file_pat
     setup_context_for_elf(out, elf_file);
 
     // Read all of the sections in the elf and look for the symbol table section
-    ELFIO::section* symtab_section = read_sections(out, elf_config, elf_file);
+    ELFIO::section* mdebug_section = nullptr;
+    ELFIO::section* symtab_section = read_sections(out, mdebug_section, elf_config, elf_file);
 
     // If no symbol table was found then exit
     if (symtab_section == nullptr) {
@@ -646,6 +731,9 @@ bool N64Recomp::Context::from_elf_file(const std::filesystem::path& elf_file_pat
 
     // Read all of the symbols in the elf and look for the entrypoint function
     found_entrypoint_out = read_symbols(out, elf_file, symtab_section, elf_config, for_dumping_context, data_syms_out);
+
+    // Process an mdebug section for static symbols. The presence of an mdebug section in the input is optional.
+    read_mdebug(out, mdebug_section, data_syms_out);
 
     return true;
 }
